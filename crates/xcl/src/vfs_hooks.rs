@@ -357,12 +357,14 @@ unsafe extern "system" fn hk_disk_free_a(n: *const u8, spc: *mut u32, bps: *mut 
 type FnCreateDirW = unsafe extern "system" fn(*const u16, *const c_void) -> i32;
 type FnPathW = unsafe extern "system" fn(*const u16) -> i32;
 type FnMoveFileExW = unsafe extern "system" fn(*const u16, *const u16, u32) -> i32;
+type FnMoveFileWithProgressW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, u32) -> i32;
 type FnCopyFileExW = unsafe extern "system" fn(*const u16, *const u16, *const c_void, *const c_void, *mut i32, u32) -> i32;
 type FnCopyFile2 = unsafe extern "system" fn(*const u16, *const u16, *const c_void) -> i32;
 static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
+static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_COPY_FILE_2: AtomicUsize = AtomicUsize::new(0);
 
@@ -436,6 +438,18 @@ fn dest_of(v: &vfs::Vfs, path: &str) -> Result<String, u32> {
 
 unsafe extern "system" fn hk_move_file_ex_w(src: *const u16, dst: *const u16, flags: u32) -> i32 {
     let orig = orig!(O_MOVE_FILE_EX_W as FnMoveFileExW);
+    move_file(src, dst, flags, |s, d, f| orig(s, d, f))
+}
+
+/// MoveFileW, MoveFileA, MoveFileExA and MoveFileWithProgressA reach MoveFileWithProgressW
+/// without going through MoveFileExW. (MoveFileExW may call it too: the guard then lets the
+/// inner call through.)
+unsafe extern "system" fn hk_move_file_with_progress_w(src: *const u16, dst: *const u16, prog: *const c_void, data: *const c_void, flags: u32) -> i32 {
+    let orig = orig!(O_MOVE_FILE_PROGRESS_W as FnMoveFileWithProgressW);
+    move_file(src, dst, flags, |s, d, f| orig(s, d, prog, data, f))
+}
+
+unsafe fn move_file(src: *const u16, dst: *const u16, flags: u32, orig: impl Fn(*const u16, *const u16, u32) -> i32) -> i32 {
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(src, dst, flags) };
     let (Some(s), d) = (from_wide_ptr(src), from_wide_ptr(dst)) else { return orig(src, dst, flags) };
     let Some(d) = d else { return orig(src, dst, flags) }; // delete-on-reboot form
@@ -753,6 +767,7 @@ pub fn install() -> Result<(), String> {
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
+        ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),
         ("CopyFile2", hk_copy_file_2 as usize, &O_COPY_FILE_2),
         ("FindFirstFileExW", hk_find_first_ex_w as usize, &O_FIND_FIRST_EX_W),
