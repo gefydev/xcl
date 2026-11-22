@@ -790,3 +790,38 @@ pub fn install() -> Result<(), String> {
         Err(errors.join("; "))
     }
 }
+
+#[cfg(test)]
+mod move_probe {
+    /// Local check only (global VFS + hooks): run alone with --ignored.
+    #[test]
+    #[ignore]
+    fn vfs_move_probe() {
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileA, MoveFileExA, MoveFileExW, MoveFileW};
+        let dir = std::env::temp_dir().join(format!("xcl_vfs_moveprobe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let game = dir.join("game");
+        std::fs::create_dir_all(&game).unwrap();
+        let data = dir.join("xcldata");
+        let temp = data.join("temp");
+        std::fs::create_dir_all(&temp).unwrap();
+        let mounts = vec![("T:".to_string(), temp.to_string_lossy().to_string())];
+        crate::vfs::init(crate::vfs::Vfs::new(&game, &data, mounts));
+        super::install().unwrap();
+        for name in ["MoveFileW", "MoveFileA", "MoveFileExW", "MoveFileExA"] {
+            std::fs::write(temp.join("a.txt"), b"x").unwrap();
+            let _ = std::fs::remove_file(temp.join("b.txt"));
+            let (wa, wb) = (crate::util::wide("T:\\a.txt"), crate::util::wide("T:\\b.txt"));
+            let ok = unsafe {
+                match name {
+                    "MoveFileW" => MoveFileW(wa.as_ptr(), wb.as_ptr()),
+                    "MoveFileA" => MoveFileA(b"T:\\a.txt\0".as_ptr(), b"T:\\b.txt\0".as_ptr()),
+                    "MoveFileExW" => MoveFileExW(wa.as_ptr(), wb.as_ptr(), 0),
+                    _ => MoveFileExA(b"T:\\a.txt\0".as_ptr(), b"T:\\b.txt\0".as_ptr(), 0),
+                }
+            };
+            println!("PROBE {name}(T:\\a.txt → T:\\b.txt): ok={ok}, moved={}", temp.join("b.txt").exists() && !temp.join("a.txt").exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
