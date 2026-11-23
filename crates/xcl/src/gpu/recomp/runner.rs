@@ -1193,18 +1193,44 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
 pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
+    let pso: ID3D12PipelineState = unsafe {
+        gpu.dev.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: transmute_copy(&gpu.rs),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
+            ..Default::default()
+        })
+    }
+    .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem)
+}
+
+/// Dispatch with an existing compute pipeline on `dev` (its own queue), e.g. one the D3D12.X
+/// backend built from a console shader: root signature `rs` with the XCL shader ABI, u0 =
+/// `sgprs`, u2 = `mem`. Returns the memory afterwards.
+pub fn dispatch_on(dev: &ID3D12Device, pso: &ID3D12PipelineState, rs: &ID3D12RootSignature, groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    unsafe {
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        dispatch_with(dev, &queue, &fence, &mut 0, pso, rs, groups, sgprs, mem)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_with(
+    dev: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    value: &mut u64,
+    pso: &ID3D12PipelineState,
+    rs: &ID3D12RootSignature,
+    groups: [u32; 3],
+    sgprs: &[u32],
+    mem: &[u32],
+) -> Result<Vec<u32>, String> {
     let mut io = sgprs.to_vec();
     io.resize(KERNEL_SGPRS, 0);
     let mem_len = mem.len().max(64);
     unsafe {
-        let dev = &gpu.dev;
-        let pso: ID3D12PipelineState = dev
-            .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: transmute_copy(&gpu.rs),
-                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as _, BytecodeLength: dxil.len() },
-                ..Default::default()
-            })
-            .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
         let (io_bytes, mem_bytes) = ((io.len() * 4) as u64, (mem_len * 4) as u64);
         let upload = buffer(dev, io_bytes + mem_bytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ, false)?;
         let mut p = std::ptr::null_mut();
@@ -1219,7 +1245,7 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         let res_buf = buffer(dev, 256, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let readback = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
-        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso).map_err(e)?;
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso).map_err(e)?;
         list.CopyBufferRegion(&io_buf, 0, &upload, 0, io_bytes);
         list.CopyBufferRegion(&mem_buf, 0, &upload, io_bytes, mem_bytes);
         list.ResourceBarrier(&[
@@ -1228,7 +1254,7 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
             transition(&res_buf, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
         let _bound = bind_resources(dev, &list, &[], &[])?;
-        list.SetComputeRootSignature(&gpu.rs);
+        list.SetComputeRootSignature(rs);
         list.SetComputeRootUnorderedAccessView(0, io_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(1, res_buf.GetGPUVirtualAddress());
         list.SetComputeRootUnorderedAccessView(2, mem_buf.GetGPUVirtualAddress());
@@ -1236,14 +1262,14 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         list.ResourceBarrier(&[transition(&mem_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyBufferRegion(&readback, 0, &mem_buf, 0, mem_bytes);
         list.Close().map_err(e)?;
-        gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
-        gpu.value += 1;
-        gpu.queue.Signal(&gpu.fence, gpu.value).map_err(e)?;
+        queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+        *value += 1;
+        queue.Signal(fence, *value).map_err(e)?;
         let ev = windows::Win32::System::Threading::CreateEventW(None, false, false, None).map_err(e)?;
-        gpu.fence.SetEventOnCompletion(gpu.value, ev).map_err(e)?;
+        fence.SetEventOnCompletion(*value, ev).map_err(e)?;
         windows::Win32::System::Threading::WaitForSingleObject(ev, 10_000);
         let _ = windows::Win32::Foundation::CloseHandle(HANDLE(ev.0));
-        if gpu.fence.GetCompletedValue() < gpu.value {
+        if fence.GetCompletedValue() < *value {
             return Err(format!("GPU did not finish within 10 s ({:?})", dev.GetDeviceRemovedReason()));
         }
         let mut q = std::ptr::null_mut();
