@@ -463,7 +463,8 @@ pub struct Options {
     /// wave64 (64-bit EXEC/VCC) or wave32 program
     pub wave64: bool,
     /// kernel mode only: 64 forces `[WaveSize(64)]` for a wave32 program, which then runs as
-    /// two independent halves – the wave-size independent form VS/PS always get (tests)
+    /// two independent halves – the wave-size independent form VS/PS always get (tests); 32
+    /// runs a wave64 program as two native wave32 halves (adapters without 64-lane waves)
     pub hw_wave: u32,
     /// geometry mode: emulate one logical wave64 with two native wave32 phases
     pub geometry_wave32: bool,

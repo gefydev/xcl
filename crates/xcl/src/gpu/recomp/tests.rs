@@ -1,6 +1,7 @@
 //! Instruction semantics checked on the real GPU: small RDNA2 programs are assembled,
 //! recompiled to HLSL, compiled with DXC and run as kernels. Skipped (with a note) when
-//! there is no D3D12 GPU with SM 6.6 + wave64 or no DXC.
+//! there is no D3D12 GPU with SM 6.6 or no DXC; the tests that need wave64 also without it,
+//! the others run as two wave32 halves on such an adapter (`gpu_ready_wave32`).
 
 use super::runner::{self, KernelState};
 use super::{translate, Mode, Options};
@@ -232,7 +233,7 @@ fn scalar_relative_move_cluster() {
 
 #[test]
 fn gpu_scalar_relative_moves() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let code = prog(&[
@@ -271,7 +272,7 @@ fn v_swaprel_b32_uses_the_m0_relative_switch() {
 
 #[test]
 fn gpu_v_swaprel_b32() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let p = prog(&[
@@ -436,8 +437,8 @@ fn f64_class_compare_vopc_and_vop3() {
     // SRC0 is the 64-bit f64 operand (VGPR/SGPR pair), SRC1 stays a plain 32-bit mask;
     // abs/neg act on the double operand only
     assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v12) >> fclass64(abs(asdouble(v10, v11)))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("(v13) >> fclass64((-asdouble(v10, v11)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v12) >> fclass64(asdouble(v10, (v11 & 0x7FFFFFFFu)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("(v13) >> fclass64(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
     // mask destinations go through the shared compare/write-mask path: vcc, an SGPR pair, exec
     assert!(t.hlsl.contains("vcc_lo = t") && t.hlsl.contains("vcc_hi = t"), "{}", t.hlsl);
     assert!(t.hlsl.contains("s20 = t") && t.hlsl.contains("s21 = t"), "{}", t.hlsl);
@@ -450,7 +451,7 @@ fn f64_class_compare_vopc_and_vop3() {
 
 #[test]
 fn gpu_f64_class_compare() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let p = prog(&[
@@ -535,8 +536,8 @@ fn frexp_f64_instructions() {
     // the source pair becomes a double; the mantissa stays f64, the exponent is one dword
     assert!(t.hlsl.contains("frexp_mant_d(asdouble(v10, v11))"), "{}", t.hlsl);
     assert!(t.hlsl.contains("(uint)frexp_exp_d(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("frexp_mant_d((-asdouble(v10, v11)))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("frexp_exp_d(abs(asdouble(v10, v11)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("frexp_mant_d(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("frexp_exp_d(asdouble(v10, (v11 & 0x7FFFFFFFu)))"), "{}", t.hlsl);
     // the f64 pair of inline −1.0 = 0xBFF0000000000000
     assert!(t.hlsl.contains("frexp_mant_d(asdouble(0x00000000u, 0xBFF00000u))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
@@ -553,7 +554,7 @@ fn rndne_f64_instructions() {
     let t = translate(&code, &Options::default()).unwrap();
     assert!(t.complete(), "{:?}\n{}", t.unsupported_why, t.hlsl);
     assert!(t.hlsl.contains("round_ne_d(asdouble(v10, v11))"), "{}", t.hlsl);
-    assert!(t.hlsl.contains("round_ne_d((-asdouble(v10, v11)))"), "{}", t.hlsl);
+    assert!(t.hlsl.contains("round_ne_d(asdouble(v10, (v11 ^ 0x80000000u)))"), "{}", t.hlsl);
     if super::dxc::location().is_ok() {
         super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
     }
@@ -561,7 +562,7 @@ fn rndne_f64_instructions() {
 
 #[test]
 fn gpu_rndne_f64() {
-    if !gpu_ready() { return; }
+    if !gpu_ready_wave32() { return; }
     let p = prog(&[("V_RNDNE_F64", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None)]);
     const INPUTS: [u64; 16] = [
         0.0f64.to_bits(), (-0.0f64).to_bits(), 0.5f64.to_bits(), (-0.5f64).to_bits(),
@@ -586,7 +587,7 @@ fn gpu_rndne_f64() {
 
 #[test]
 fn gpu_frexp_f64_exp_and_mant() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let p = prog(&[
@@ -649,7 +650,7 @@ fn gpu_frexp_f64_exp_and_mant() {
 
 #[test]
 fn gpu_valu_float_and_int() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let code = prog(&[
@@ -697,7 +698,7 @@ fn gpu_valu_float_and_int() {
 
 #[test]
 fn gpu_bench_really_runs() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     println!("GPU: {} / DXC: {}", runner::adapter().unwrap(), super::dxc::location().unwrap().display());
@@ -717,6 +718,32 @@ fn gpu_bench_really_runs() {
         assert_eq!(r.vgpr[l][1], want, "lane {l}");
     }
     assert_eq!((r.sgpr[126], r.sgpr[127]), (0x5555_5555, 0x5555_5555));
+}
+
+/// A wave64 kernel as two native wave32 halves (an adapter without 64-lane waves): each half
+/// writes its own word of a lane mask, and the result has both; uniform SGPRs stay as they are.
+#[test]
+fn gpu_kernel_halves_merge_lane_masks() {
+    if !gpu_ready_wave32() {
+        return;
+    }
+    let code = prog(&[
+        ("V_CMP_GT_U32", "ENC_VOPC", &[("SRC0", 255), ("VSRC1", 0)], Some(40)), // vcc = v0 < 40
+        ("S_MOVK_I32", "ENC_SOPK", &[("SDST", 5), ("SIMM16", 0x1234)], None),
+    ]);
+    let t = translate(&code, &Options { hw_wave: 32, ..Default::default() }).unwrap();
+    assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("[numthreads(64, 1, 1)]"), "{}", t.hlsl);
+    let dxil = super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap();
+    let mut st = KernelState::default();
+    st.sgpr[126] = u32::MAX;
+    st.sgpr[127] = u32::MAX;
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[0] = l as u32;
+    }
+    let r = runner::run(&dxil, &st, &[]).unwrap();
+    assert_eq!((r.sgpr[106], r.sgpr[107]), (u32::MAX, 0xFF), "vcc");
+    assert_eq!(r.sgpr[5], 0x1234, "uniform s5");
+    assert_eq!((r.sgpr[126], r.sgpr[127]), (u32::MAX, u32::MAX), "exec");
 }
 
 #[test]
@@ -846,7 +873,7 @@ fn gpu_divergence_through_exec() {
 
 #[test]
 fn gpu_memory_and_exports() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let code = prog(&[
@@ -1034,7 +1061,7 @@ fn buffer_format_d16_packs_and_unpacks_halves() {
 
 #[test]
 fn gpu_typed_buffer_loads_and_stores() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let ident = 4 | 5 << 3 | 6 << 6 | 7 << 9;
@@ -1190,7 +1217,7 @@ fn tsharp(index: u32, format: u32, ty: u32) -> [u32; 8] {
 
 #[test]
 fn gpu_images_sample_load_store_atomic() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     use runner::{TestSampler, TestTexture, TexDim};
@@ -1281,7 +1308,7 @@ fn gpu_images_sample_load_store_atomic() {
 /// texel boundary with each; they become static samplers of the root signature.
 #[test]
 fn gpu_static_samplers_from_constants_in_code() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     use runner::{TestTexture, TexDim};
@@ -1337,7 +1364,7 @@ fn gpu_static_samplers_from_constants_in_code() {
 
 #[test]
 fn gpu_images_a16_d16() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     use runner::{TestSampler, TestTexture, TexDim};
@@ -1490,7 +1517,7 @@ fn global_dword_addtid_address_is_saddr_plus_4_per_lane() {
 /// "off" SADDR sentinel gives a zero base and the signed offset can point below the base.
 #[test]
 fn gpu_dword_addtid_per_lane_addresses() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap();
@@ -1534,7 +1561,7 @@ fn gpu_dword_addtid_per_lane_addresses() {
 
 #[test]
 fn gpu_valu_16_and_64_bit() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let p = prog(&[
@@ -1608,7 +1635,7 @@ fn gpu_valu_16_and_64_bit() {
 
 #[test]
 fn gpu_packed_math_dots_movrel() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let p = prog(&[
@@ -1925,7 +1952,7 @@ fn retail_ps_gallery() {
 
 #[test]
 fn gpu_image_sample_offset() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     use runner::{TestSampler, TestTexture, TexDim};
@@ -2514,7 +2541,7 @@ fn gpu_geometry_wave32_prefix_count_over_a_mask() {
 /// (retail GS code: `ds_read2_b32 v[0:1], v0 offset1:1`).
 #[test]
 fn gpu_ds_read_destination_overlaps_address() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let mut code = Vec::new();
@@ -2538,7 +2565,7 @@ fn gpu_ds_read_destination_overlaps_address() {
 /// (t, denominator, i, j) numerators, misses, and the 64-bit node pointer form.
 #[test]
 fn gpu_bvh_intersect_ray() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let base = 0x1000usize;
@@ -3115,7 +3142,7 @@ fn gpu_bvh64_intersect_ray_across_memory_windows_and_grazing() {
 /// lanes share dwords, so a non-atomic read-modify-write would lose writes.
 #[test]
 fn gpu_global_atomics_and_sub_dword_access() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap();
@@ -3196,7 +3223,7 @@ fn gpu_global_atomics_and_sub_dword_access() {
 /// and d16 accesses, scratch, SAD / lerp, the division helpers, saturating adds, packs, swap.
 #[test]
 fn gpu_more_atomics_sub_dword_scratch_valu() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
@@ -3341,7 +3368,7 @@ fn gpu_more_atomics_sub_dword_scratch_valu() {
 /// Per-lane cells are deterministic; the three shared cells end in the unique winner's value.
 #[test]
 fn gpu_atomic_fcmpswap_x2() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
@@ -3439,7 +3466,7 @@ fn gpu_atomic_fcmpswap_x2() {
 /// fmax(3, -0) = 3. Both code paths: global (flat / global) and buffer.
 #[test]
 fn gpu_atomic_fmin_fmax_negative_zero() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let glbl = |n: &'static str, f: &[(&str, u64)]| encode(n, "ENC_FLAT_GLBL", f, None).unwrap();
@@ -3484,7 +3511,7 @@ fn gpu_atomic_fmin_fmax_negative_zero() {
 /// the f32 test. A seventh, per-lane cell checks the GLC return (global).
 #[test]
 fn gpu_atomic_fmin_fmax_x2() {
-    if !gpu_ready() {
+    if !gpu_ready_wave32() {
         return;
     }
     let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));

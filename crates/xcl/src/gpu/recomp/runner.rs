@@ -532,9 +532,23 @@ pub fn run_program(code: &[u8], state: &KernelState, extra: &[u32]) -> Result<(K
     Ok((run_code(code, state, &mem)?, at))
 }
 
+/// Kernel options for a wave64 test program on this adapter: without 64-lane waves (NVIDIA)
+/// it runs as two wave32 halves, as console mesh and compute programs do there – refused when
+/// the program needs both halves at once.
+fn kernel_options(code: &[u8]) -> Result<super::Options, String> {
+    if wave64_supported()? {
+        return Ok(super::Options::default());
+    }
+    let hazards = super::geometry_wave32_hazards(code);
+    if !hazards.is_empty() {
+        return Err(format!("needs a 64-lane wave (cross-half semantics: {hazards:?})"));
+    }
+    Ok(super::Options { hw_wave: 32, ..Default::default() })
+}
+
 /// Translate + compile + run RDNA2 code as a kernel, with test textures and samplers.
 pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[TestTexture], samplers: &[TestSampler]) -> Result<KernelResult, String> {
-    let t = super::translate(code, &super::Options::default())?;
+    let t = super::translate(code, &kernel_options(code)?)?;
     if !t.complete() {
         return Err(format!("unsupported instructions: {:?}", t.unsupported));
     }
@@ -544,8 +558,7 @@ pub fn run_code_with(code: &[u8], state: &KernelState, mem: &[u32], textures: &[
 
 /// Translate + compile + run RDNA2 code as a kernel.
 pub fn run_code(code: &[u8], state: &KernelState, mem: &[u32]) -> Result<KernelResult, String> {
-    let opt = super::Options::default();
-    let t = super::translate(code, &opt)?;
+    let t = super::translate(code, &kernel_options(code)?)?;
     if !t.complete() {
         return Err(format!("unsupported instructions: {:?}", t.unsupported));
     }

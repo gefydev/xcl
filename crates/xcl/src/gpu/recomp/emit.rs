@@ -2443,15 +2443,17 @@ impl Em {
             }
         }
         let u64v = |i: usize| format!("(((uint64_t){} << 32) | (uint64_t){})", lo_hi[i].1, lo_hi[i].0);
+        // abs / neg on the sign bit, as the hardware applies them: `-x` is `fsub -0.0, x` in
+        // DXIL, which leaves the sign of a NaN to the driver
         let f64v = |i: usize| {
-            let mut s = format!("asdouble({}, {})", lo_hi[i].0, lo_hi[i].1);
+            let mut hi = lo_hi[i].1.clone();
             if m.abs[i.min(2)] {
-                s = format!("abs({s})");
+                hi = format!("({hi} & 0x7FFFFFFFu)");
             }
             if m.neg[i.min(2)] {
-                s = format!("(-{s})");
+                hi = format!("({hi} ^ 0x80000000u)");
             }
-            s
+            format!("asdouble({}, {hi})", lo_hi[i].0)
         };
         let dst = outs.first().map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
         let t = self.t();
@@ -3506,13 +3508,18 @@ impl Em {
             Mode::Kernel => {
                 // hw_wave 64 with a wave32 program: the wave-size independent form (two halves)
                 let split = self.opt.hw_wave == 64 && !self.opt.wave64;
+                // hw_wave 32 with a wave64 program: two native wave32 halves of one logical wave
+                let halves = self.opt.hw_wave == 32 && self.opt.wave64;
                 let lanes = if self.opt.wave64 || split { 64 } else { 32 };
+                let native = if halves { 32 } else { lanes };
                 if self.uses_lds {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
-                let _ = writeln!(h, "[WaveSize({lanes})]\n[numthreads({lanes}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
+                let _ = writeln!(h, "[WaveSize({native})]\n[numthreads({lanes}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex)\n{{");
                 if split {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    xcl_w32 = WaveGetLaneCount() > 32u;\n    xcl_half = xcl_w32 ? xcl_hw_lane >> 5 : 0u;\n    lane_id = xcl_hw_lane & 31u;\n");
+                } else if halves {
+                    h.push_str("    xcl_half = (gi >> 5) & 1u;\n    xcl_logical_wave64 = true;\n    uint xcl_hw_lane = WaveGetLaneIndex() + 32u * xcl_half;\n    lane_id = xcl_hw_lane;\n");
                 } else {
                     h.push_str("    uint xcl_hw_lane = WaveGetLaneIndex();\n    lane_id = xcl_hw_lane;\n");
                 }
@@ -3522,12 +3529,23 @@ impl Em {
                     let _ = writeln!(h, "    uint v{v} = io.Load(({}u + xcl_hw_lane * {}u + {v}u) * 4u);", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
                 h.push_str(body);
-                h.push_str("    if (xcl_hw_lane == 0u) {\n");
-                for &c in &sg {
-                    let _ = writeln!(h, "        res.Store({}u, {});", c * 4, sname(c).unwrap());
+                if halves {
+                    // each half holds its own word of a lane mask (the other is 0) and the same
+                    // uniform values: the first lane of each ORs them into the zeroed result
+                    h.push_str("    if ((xcl_hw_lane & 31u) == 0u) {\n");
+                    for &c in &sg {
+                        let _ = writeln!(h, "        res.InterlockedOr({}u, {});", c * 4, sname(c).unwrap());
+                    }
+                    let _ = writeln!(h, "        res.InterlockedOr({}u, scc);", KERNEL_SCC_SLOT * 4);
+                    h.push_str("    }\n");
+                } else {
+                    h.push_str("    if (xcl_hw_lane == 0u) {\n");
+                    for &c in &sg {
+                        let _ = writeln!(h, "        res.Store({}u, {});", c * 4, sname(c).unwrap());
+                    }
+                    let _ = writeln!(h, "        res.Store({}u, scc);", KERNEL_SCC_SLOT * 4);
+                    h.push_str("    }\n");
                 }
-                let _ = writeln!(h, "        res.Store({}u, scc);", KERNEL_SCC_SLOT * 4);
-                h.push_str("    }\n");
                 for &v in &self.vgprs {
                     let _ = writeln!(h, "    res.Store(({}u + xcl_hw_lane * {}u + {v}u) * 4u, v{v});", KERNEL_SGPRS, KERNEL_VGPRS);
                 }
