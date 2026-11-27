@@ -1123,7 +1123,8 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     let mut placed_hr = None;
     if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
-        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        let console_texture = crate::hle::xg::Texture::new(&x).ok();
+        let console_bytes = console_texture.as_ref().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
         if super::vram::gpu_owned(flags) {
             if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, console_bytes, riid, ppv) {
                 if hr >= 0 && !(*ppv).is_null() {
@@ -1135,7 +1136,16 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
                 return hr;
             }
         } else {
-            placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
+            // Defer array pages only when the title upload can supply every PC subresource.
+            let array_can_upload = pc.DepthOrArraySize > 1
+                && pc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && super::vram::level_pages()
+                && console_bytes.is_some()
+                && pc_format == u32::from_le_bytes(x[0x20..0x24].try_into().unwrap())
+                && console_texture.as_ref().filter(|t| t.planes.len() == 1).and_then(|t| t.texels()).is_some_and(|s| {
+                    s.depth == 0 && s.array == u32::from(pc.DepthOrArraySize) && s.chain.levels.len() == pc.MipLevels as usize
+                });
+            placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, array_can_upload, riid, ppv);
         }
     }
     let hr = match placed_hr {

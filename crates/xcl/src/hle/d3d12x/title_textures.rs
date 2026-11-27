@@ -1171,7 +1171,7 @@ unsafe fn map_levels_with_texels(r: &ID3D12Resource, subs: &[Subresource]) {
     if !super::vram::has_lazy_levels(r.as_raw() as usize) {
         return;
     }
-    // (one slice: its subresources are its levels)
+    // `subs` is in D3D12 subresource order (mip first, then array slice).
     let present: Vec<u32> = subs.iter().enumerate().filter(|(_, s)| !all_zero(&s.data)).map(|(i, _)| i as u32).collect();
     super::vram::map_levels(r, Some(&present));
 }
@@ -2513,9 +2513,9 @@ mod tests {
             let riid = &ID3D12Resource::IID as *const windows::core::GUID as *const windows_sys::core::GUID;
             // 1024x1024 RGBA8, 11 levels, 64 KiB blocks: 5.4 MiB on the console
             let d = console_desc(3, 1024, 1024, 1, 11, 28, 0x109);
-            let place_tex = |va: usize| -> ID3D12Resource {
+            let place_tex = |desc: &[u8; 0x38], va: usize| -> ID3D12Resource {
                 let mut p = std::ptr::null_mut();
-                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, d.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
+                let hr = super::super::device_x::create_placed_resource_x(dev.as_raw(), va as u64, desc.as_ptr(), D3D12_RESOURCE_STATE_COMMON.0 as u32, std::ptr::null(), riid, &mut p);
                 assert!(hr >= 0 && !p.is_null(), "CreatePlacedResourceX failed: {hr:#x}");
                 ID3D12Resource::from_raw(p)
             };
@@ -2573,7 +2573,7 @@ mod tests {
             let dev_key = dev.as_raw() as usize;
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let p0 = dev_pages();
-            let small = place_tex(at);
+            let small = place_tex(&d, at);
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             if !super::super::vram::has_lazy_levels(small.as_raw() as usize) {
                 // (not reserved, or a tiling that does not add up: it has its pages as before)
@@ -2597,7 +2597,7 @@ mod tests {
             // the title maps memory under mip 0 and fills it
             assert!(!VirtualAlloc((at + top) as *const c_void, size - top, MEM_COMMIT, PAGE_READWRITE).is_null());
             std::ptr::copy_nonoverlapping(whole.as_ptr().add(top), (at + top) as *mut u8, size - top);
-            let full = place_tex(at);
+            let full = place_tex(&d, at);
             refresh(queue.as_raw());
             assert_eq!(dev_pages() - p0, (all as usize) << 16, "mip 0's pages come with its texels; the other levels' are shared");
             for sub in 0..11u32 {
@@ -2610,6 +2610,44 @@ mod tests {
             assert!(read_sub(&small, 0) == want[0].data, "a GPU-written texture has pages under all its levels");
             super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
             drop((small, full));
+            VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+
+            // A two-slice array with two standard mips per slice. Only slice 1, mip 1 has texels.
+            let d = console_desc(3, 512, 512, 2, 2, 28, 0x109);
+            let tex = xg::Texture::new(&d).unwrap();
+            let surface = tex.texels().unwrap();
+            let size = tex.size() as usize;
+            let at = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(at, 0);
+            let chain = &surface.chain;
+            let slice = std::slice::from_raw_parts_mut((at + chain.slice_bytes) as *mut u8, chain.slice_bytes);
+            let want = vec![0xA7; 256 * 256 * 4];
+            chain.tile_level(slice, 1, 1, &want);
+
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            let array = place_tex(&d, at);
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            if array.GetDesc().Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE {
+                drop(array);
+                VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
+                return println!("SKIPPED {NAME}: this adapter refused the reserved texture array");
+            }
+            assert!(super::super::vram::has_lazy_levels(array.as_raw() as usize), "a reserved array with standard mips must start with lazy pages");
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(true, Ordering::Relaxed);
+            refresh(queue.as_raw());
+            super::super::vram::LEVEL_PAGES_FOR_TEST.store(false, Ordering::Relaxed);
+            assert_eq!(read_sub(&array, 3), want, "slice 1 mip 1 received its texels");
+            for sub in 0..3 {
+                assert!(read_sub(&array, sub).iter().all(|&b| b == 0), "unmapped subresource {sub} reads as zero");
+            }
+            assert!(super::super::vram::map_levels(&array, Some(&[3])).is_empty());
+            assert_eq!(super::super::vram::map_levels(&array, Some(&[0, 1, 2])), vec![0, 1, 2], "the upload left all three empty subresources without tiles");
+            let key = array.as_raw() as usize;
+            super::super::vram::unmap_superseded(&array);
+            assert!(read_sub(&array, 3).iter().all(|&b| b == 0), "retiring the texture unmapped the second slice");
+            assert!(super::super::vram::remap_if_unmapped(&array));
+            assert!(super::super::vram::has_lazy_levels(key));
+            drop(array);
             VirtualFree(at as *mut c_void, 0, MEM_RELEASE);
         }
     }

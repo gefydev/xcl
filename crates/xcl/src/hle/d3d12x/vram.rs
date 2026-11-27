@@ -236,21 +236,21 @@ struct Target {
 }
 
 /// The tiles of a texture whose levels get video memory when an upload first has texels for
-/// them (`level_pages`): a group for each level with tiles of its own, in order, then one for
-/// the packed levels.
+/// them (`level_pages`): a group for each standard subresource in order, plus one for the
+/// packed levels of a single-slice texture.
 #[derive(Clone, Debug, PartialEq)]
 struct Levels {
     /// (the group's first subresource, its first tile in the resource, its tiles, mapped)
     groups: Vec<(u32, u32, u32, bool)>,
-    /// the texture's levels (the last group's go up to here)
-    mips: u32,
+    /// the number of subresources (the last group ends here)
+    subresources: u32,
 }
 
 impl Levels {
     /// From the resource's tiling: `standard` (first tile, tiles) of each level with tiles of
     /// its own, `packed` the same of the packed levels, `total` tiles in all. None: they do not
     /// add up to the resource (it then gets all its pages at once).
-    fn new(standard: &[(u32, u32)], packed: Option<(u32, u32)>, total: u32, mips: u32) -> Option<Levels> {
+    fn new(standard: &[(u32, u32)], packed: Option<(u32, u32)>, total: u32, subresources: u32) -> Option<Levels> {
         let mut groups: Vec<(u32, u32, u32, bool)> = standard.iter().enumerate().map(|(i, &(first, n))| (i as u32, first, n, false)).collect();
         if let Some((first, n)) = packed {
             groups.push((standard.len() as u32, first, n, false));
@@ -264,12 +264,12 @@ impl Levels {
             }
             next = g.1.checked_add(g.2)?;
         }
-        (next == total && !groups.is_empty()).then_some(Levels { groups, mips })
+        (next == total && !groups.is_empty()).then_some(Levels { groups, subresources })
     }
 
     /// The levels of group `k`.
     fn levels_of(&self, k: usize) -> std::ops::Range<u32> {
-        self.groups[k].0..self.groups.get(k + 1).map_or(self.mips, |g| g.0)
+        self.groups[k].0..self.groups.get(k + 1).map_or(self.subresources, |g| g.0)
     }
 
     /// The group level `level` is in (the packed levels share the last one).
@@ -278,8 +278,8 @@ impl Levels {
     }
 }
 
-/// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture of one slice on the
-/// shared pages gets the pages of a level when an upload first has texels for it. A retail game
+/// `XCL_TEXTURE_LEVEL_PAGES=1` (off by default): a sampled 2D texture on the shared pages gets
+/// the pages of a subresource when an upload first has texels for it. A retail game
 /// places its streamed textures at full size and maps memory under their levels as it loads
 /// them, the small ones first; with a page for every 64 KiB a texture covers most of the pages
 /// are for levels that are not loaded.
@@ -320,21 +320,41 @@ impl Levels {
     }
 }
 
-/// The tiling of reserved texture `res` of `mips` levels as `Levels`, and its tiles in all.
-unsafe fn level_tiling(dev: &ID3D12Device, res: &ID3D12Resource, mips: u32) -> (Option<Levels>, u32) {
+/// The tiling of a reserved texture as `Levels`, and its tiles in all (even on eager fallback).
+unsafe fn level_tiling(dev: &ID3D12Device, res: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> (Option<Levels>, u32) {
     let mut total = 0u32;
+    let slices = u32::from(desc.DepthOrArraySize);
+    let mips = u32::from(desc.MipLevels);
+    if slices > 1 {
+        let mut format = D3D12_FEATURE_DATA_FORMAT_INFO { Format: desc.Format, PlaneCount: 0 };
+        if dev.CheckFeatureSupport(D3D12_FEATURE_FORMAT_INFO, (&mut format as *mut D3D12_FEATURE_DATA_FORMAT_INFO).cast(), std::mem::size_of_val(&format) as u32).is_err()
+            || format.PlaneCount != 1
+        {
+            dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+            return (None, total);
+        }
+    }
     let mut packed = D3D12_PACKED_MIP_INFO::default();
-    let mut n = mips;
-    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); mips as usize];
+    let subresources = mips * slices;
+    let mut n = subresources;
+    let mut tilings = vec![D3D12_SUBRESOURCE_TILING::default(); subresources as usize];
     dev.GetResourceTiling(res, Some(&mut total), Some(&mut packed), None, Some(&mut n), 0, tilings.as_mut_ptr());
+    // Packed array tails require tiled resources tier 4. Keep the eager path for those layouts.
+    let standard_mips = u32::from(packed.NumStandardMips);
+    if standard_mips + u32::from(packed.NumPackedMips) != mips || (slices > 1 && packed.NumPackedMips != 0) {
+        return (None, total);
+    }
+    let standard_count = standard_mips * slices;
+    if n < standard_count {
+        return (None, total);
+    }
     let standard: Vec<(u32, u32)> = tilings
         .iter()
-        .take((packed.NumStandardMips as usize).min(n as usize))
+        .take(standard_count as usize)
         .map(|t| (t.StartTileIndexInOverallResource, t.WidthInTiles * t.HeightInTiles as u32 * t.DepthInTiles as u32))
         .collect();
     let tail = (packed.NumPackedMips > 0).then_some((packed.StartTileIndexInOverallResource, packed.NumTilesForPackedMips));
-    let whole = standard.len() == packed.NumStandardMips as usize && packed.NumStandardMips as u32 + packed.NumPackedMips as u32 == mips;
-    (if whole { Levels::new(&standard, tail, total, mips) } else { None }, total)
+    (Levels::new(&standard, tail, total, subresources), total)
 }
 
 /// Per-heap free-tile allocator for `Pages`.
@@ -996,13 +1016,14 @@ unsafe fn place_on_pages(
     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
     let mut total = 0u32;
     let levels = if lazy {
-        let (levels, n) = level_tiling(dev, res, desc.MipLevels as u32);
+        let (levels, n) = level_tiling(dev, res, desc);
         total = n;
         levels.filter(|_| total > 0 && owned_pages(va, console_bytes, total as usize).is_some())
     } else {
         dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
         None
     };
+    let deferred_array = desc.DepthOrArraySize > 1 && levels.is_some();
     let bound = {
         let mut g = PAGES.lock().unwrap();
         if let Some(Some(pages)) = g.get_mut(&dev_key) {
@@ -1026,6 +1047,10 @@ unsafe fn place_on_pages(
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
+    }
+    if deferred_array {
+        static NOTE_ARRAY: std::sync::Once = std::sync::Once::new();
+        NOTE_ARRAY.call_once(|| crate::xlog_info!("D3D12.X: level pages: deferred {total} tiles for a sampled texture with {} slices and {} mips", desc.DepthOrArraySize, desc.MipLevels));
     }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
@@ -1293,6 +1318,7 @@ pub unsafe fn place_pages(
     state: u32,
     clear: *const c_void,
     console_bytes: Option<u64>,
+    array_can_upload: bool,
     riid: *const windows_sys::core::GUID,
     ppv: *mut *mut c_void,
 ) -> Option<HRESULT> {
@@ -1303,8 +1329,11 @@ pub unsafe fn place_pages(
     if console_has_packed_3d_mips(desc) {
         return None;
     }
-    // (one slice: the tiles of an array's packed levels are not asked about here)
-    let lazy = level_pages() && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.DepthOrArraySize == 1 && desc.SampleDesc.Count == 1 && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
+    let lazy = level_pages()
+        && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && (desc.DepthOrArraySize == 1 || array_can_upload)
+        && desc.SampleDesc.Count == 1
+        && desc.Flags == D3D12_RESOURCE_FLAG_NONE;
     place_on_pages(dev, this, va, desc, state, clear, console_bytes, false, lazy, riid, ppv)
 }
 
